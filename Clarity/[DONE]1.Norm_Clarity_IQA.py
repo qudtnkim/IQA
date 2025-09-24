@@ -1,126 +1,177 @@
 import os
 import glob
+import csv
+import argparse
 import numpy as np
 import cv2
-import csv
+from typing import Tuple, List
 
-# Function to calculate high-frequency to low-frequency ratio with dynamic cutoff
-def calculate_frequency_ratio(image, cutoff_ratio=0.018):
+# --- Core Image Processing Functions ---
+
+def calculate_hlfr(image: np.ndarray, cutoff_ratio: float = 0.02) -> float:
     """
-    Calculate the high-frequency to low-frequency ratio of an image with dynamic cutoff.
+    Calculates the High-to-Low Frequency Ratio (HLFR) for a grayscale image.
+
+    This metric quantifies image sharpness by comparing the energy in high-frequency
+    components to that in low-frequency components. A higher HLFR value
+    generally corresponds to a sharper image.
 
     Args:
-        image: Input grayscale image (2D array).
-        cutoff_ratio: Ratio to determine dynamic cutoff based on image size.
+        image (np.ndarray): Input grayscale image (2D NumPy array).
+        cutoff_ratio (float): A ratio of the image's smaller dimension, used to
+                              define the boundary of the low-frequency region.
 
     Returns:
-        Ratio of high-frequency energy to low-frequency energy.
+        float: The calculated HLFR score.
     """
-    # Apply Fourier Transform
-    f = np.fft.fft2(image)
-    fshift = np.fft.fftshift(f)
-    magnitude_spectrum = np.abs(fshift)
+    if image.ndim != 2:
+        raise ValueError("Input image must be a 2D grayscale array.")
 
-    # Define frequency regions
-    height, width = magnitude_spectrum.shape
-    center = (height // 2, width // 2)
+    # 1. Apply 2D Fast Fourier Transform (FFT) and shift the zero-frequency
+    #    component to the center of the spectrum.
+    f_transform = np.fft.fft2(image)
+    f_transform_shifted = np.fft.fftshift(f_transform)
+    magnitude_spectrum = np.abs(f_transform_shifted)
 
-    # Calculate dynamic cutoff based on image size
-    cutoff = int(min(height, width) * cutoff_ratio)
+    # 2. Define the low-frequency region based on the cutoff ratio.
+    rows, cols = image.shape
+    center_row, center_col = rows // 2, cols // 2
+    cutoff = int(min(rows, cols) * cutoff_ratio)
 
-    # Low-frequency energy (center region)
+    # 3. Sum the energy within the low-frequency region (a central square).
     low_freq_energy = np.sum(
-        magnitude_spectrum[center[0] - cutoff:center[0] + cutoff, center[1] - cutoff:center[1] + cutoff]
+        magnitude_spectrum[
+            center_row - cutoff : center_row + cutoff,
+            center_col - cutoff : center_col + cutoff,
+        ]
     )
 
-    # Total energy minus low-frequency gives high-frequency energy
+    # 4. High-frequency energy is the total energy minus the low-frequency energy.
     total_energy = np.sum(magnitude_spectrum)
     high_freq_energy = total_energy - low_freq_energy
 
-    # Avoid division by zero
+    # 5. Calculate the ratio, handling potential division by zero.
     if low_freq_energy == 0:
-        return 0
-
-    # Calculate high-frequency to low-frequency ratio
+        return np.inf  # Or a large number, as this implies all energy is high-frequency
+    
     return high_freq_energy / low_freq_energy
 
-# Function to extract triangular region with standard ROI size
-def extract_triangle(image, standard_size=(1255, 1080), ratio_w=90/1255, ratio_h=100/1080):
+def crop_to_central_roi(image: np.ndarray, target_size: Tuple[int, int] = (1255, 1080)) -> np.ndarray:
     """
-    Crop the image to remove triangular regions using standard dimensions.
+    Resizes an image to a standard size and crops it to a central region of interest.
+    
+    This function is primarily used to remove potential artifacts or irrelevant
+    information from the borders of an image by focusing on its central area.
 
     Args:
-        image: Input grayscale image (2D array).
-        standard_size: Standard image size to resize before cropping.
-        ratio_w: Width ratio to determine crop area.
-        ratio_h: Height ratio to determine crop area.
+        image (np.ndarray): The input grayscale image.
+        target_size (Tuple[int, int]): The standard (width, height) to which the image
+                                     is resized before cropping.
 
     Returns:
-        Cropped image excluding triangular regions.
+        np.ndarray: The cropped central region of the image.
     """
-    # Resize image to standard size
-    resized_image = cv2.resize(image, standard_size)
+    resized_image = cv2.resize(image, target_size)
+    h, w = resized_image.shape
 
-    # Calculate crop dimensions
-    height, width = resized_image.shape[:2]
-    t_width = int(ratio_w * width)
-    t_height = int(ratio_h * height)
+    # Define margins to crop from each side (e.g., 10% from height, 7% from width)
+    crop_margin_h = int(h * 0.10)
+    crop_margin_w = int(w * 0.07)
+    
+    start_row, end_row = crop_margin_h, h - crop_margin_h
+    start_col, end_col = crop_margin_w, w - crop_margin_w
+    
+    return resized_image[start_row:end_row, start_col:end_col]
 
-    crop_width = width - 2 * t_width
-    crop_height = height - 2 * t_height
 
-    center_y, center_x = height // 2, width // 2
-    start_y = max(center_y - crop_height // 2, 0)
-    end_y = min(center_y + crop_height // 2, height)
-    start_x = max(center_x - crop_width // 2, 0)
-    end_x = min(center_x + crop_width // 2, width)
+# --- Main Application Logic ---
 
-    return resized_image[start_y:end_y, start_x:end_x]
+def main(args):
+    """
+    Main function to process a directory of images:
+    1. Calculates a clarity score (HLFR) for each image's S-channel.
+    2. Normalizes the scores using Z-score standardization.
+    3. Saves the image names, raw scores, and normalized scores to a CSV file.
+    """
+    image_paths = sorted(glob.glob(os.path.join(args.input_dir, "*.png")))
+    if not image_paths:
+        print(f"Error: No PNG images found in the specified directory: '{args.input_dir}'")
+        return
 
-# Define CSV output file
-output_csv = "250120_S_CHANNEL_Clarity_result.csv"
-freq_ratios = []  # Store frequency ratios for normalization
-image_names = []  # Store image names
+    print(f"Found {len(image_paths)} images. Starting clarity analysis...")
+    
+    results = []
+    total_images = len(image_paths)
 
-# Get list of images
-image_paths = glob.glob("../1-0.Train_DB/*.png")
-total_images = len(image_paths)
+    for i, path in enumerate(image_paths):
+        image_name = os.path.basename(path)
+        image_bgr = cv2.imread(path)
+        
+        if image_bgr is None:
+            print(f"Warning: Could not read image '{image_name}'. Skipping.")
+            continue
 
-# First pass: Calculate frequency ratios for all images
-print(f"Processing {total_images} images...")
-for idx, image_path in enumerate(image_paths, start=1):
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Could not read {image_path}. Skipping.")
-        continue
+        # Convert image to HSV color space and extract the Saturation (S) channel.
+        # The S-channel is often effective for capturing texture and clarity.
+        image_hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        s_channel = image_hsv[:, :, 1]
+        
+        # Crop the S-channel to the central region to avoid edge artifacts.
+        s_roi = crop_to_central_roi(s_channel)
+        
+        # Calculate the High-to-Low Frequency Ratio.
+        hlfr_score = calculate_hlfr(s_roi)
+        
+        results.append({"Image Name": image_name, "HLFR_Score": hlfr_score})
+        
+        # Print progress update
+        if (i + 1) % 50 == 0 or (i + 1) == total_images:
+            print(f"  Processed [{i + 1}/{total_images}] images...")
 
-    # Convert the image to HSV
-    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # --- Data Normalization and Saving ---
+    if not results:
+        print("No images were processed successfully. Exiting.")
+        return
 
-    # Extract S channel and crop
-    s_channel = hsv_image[:, :, 1]
-    s_triangle = extract_triangle(s_channel)
+    hlfr_scores = np.array([res["HLFR_Score"] for res in results])
+    mean_score = np.mean(hlfr_scores)
+    std_score = np.std(hlfr_scores)
+    
+    print("\nCalculating Z-scores for normalization...")
+    # Z-score = (value - mean) / std_deviation
+    normalized_scores = (hlfr_scores - mean_score) / std_score
+    
+    for i, res in enumerate(results):
+        res["Normalized_HLFR_Score"] = normalized_scores[i]
 
-    # Calculate dynamic frequency ratio
-    s_freq_ratio = calculate_frequency_ratio(s_triangle)
-    freq_ratios.append(s_freq_ratio)
-    image_names.append(os.path.basename(image_path))
+    print(f"Writing results to '{args.output_csv}'...")
+    with open(args.output_csv, 'w', newline='') as csvfile:
+        fieldnames = ["Image Name", "HLFR_Score", "Normalized_HLFR_Score"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+        
+    print("\nAnalysis complete. Results saved successfully.")
 
-    # Print progress every 10 images
-    if idx % 10 == 0 or idx == total_images:
-        print(f"[{idx}/{total_images}] Processed {os.path.basename(image_path)}")
 
-# Normalize frequency ratios (Z-score normalization)
-mean_ratio = np.mean(freq_ratios)
-std_ratio = np.std(freq_ratios)
-normalized_ratios = [(x - mean_ratio) / std_ratio for x in freq_ratios]
-
-# Second pass: Write normalized results to CSV
-print("Writing results to CSV...")
-with open(output_csv, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(["Image Name", "Normalized S Frequency Ratio"])
-
-    for image_name, norm_ratio in zip(image_names, normalized_ratios):
-        writer.writerow([image_name, norm_ratio])
-print(f"Results saved to {output_csv}")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Analyzes the clarity of images in a directory using a frequency-based "
+                    "metric (HLFR) and saves the raw and normalized scores to a CSV file."
+    )
+    
+    parser.add_argument(
+        "-i", "--input_dir",
+        type=str,
+        required=True,
+        help="Path to the directory containing the input PNG images."
+    )
+    parser.add_argument(
+        "-o", "--output_csv",
+        type=str,
+        required=True,
+        help="Path to save the output CSV file with clarity scores."
+    )
+    
+    args = parser.parse_args()
+    main(args)
