@@ -33,11 +33,11 @@ GMM을 이용한 자동 임계값 결정: 전체 데이터의 선명도 점수 �
 
 
 ## 사용방법
-# 1. 데이터셋의 모든 이미지에 대해 선명도 점수를 계산하고 CSV 파일로 저장합니다.
+### 1. 데이터셋의 모든 이미지에 대해 선명도 점수를 계산하고 CSV 파일로 저장합니다.
 python Norm_Clarity_IQA.py --input_dir "path/to/your/images" --output_csv "clarity_scores.csv"
 
-# 2. 생성된 CSV 파일을 바탕으로 GMM을 실행하여 최적의 임계값을 찾습니다.
+### 2. 생성된 CSV 파일을 바탕으로 GMM을 실행하여 최적의 임계값을 찾습니다.
 python Make_blur_distribution_gaussianMixture.py --input_csv "clarity_scores.csv"
 
-# 3. 위에서 찾은 임계값을 사용하여 흐릿한 이미지를 별도 폴더로 분리합니다.
+### 3. 위에서 찾은 임계값을 사용하여 흐릿한 이미지를 별도 폴더로 분리합니다.
 python NORM_CLARITY_IMAGE_RETURN.py --image_dir "path/to/your/images" --scores_csv "clarity_scores.csv" --threshold <calculated_threshold>
