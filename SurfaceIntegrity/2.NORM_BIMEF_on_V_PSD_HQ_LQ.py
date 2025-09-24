@@ -1,199 +1,195 @@
+import os
+import glob
+import argparse
+import pandas as pd
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-from scipy.signal import welch
-from scipy.integrate import trapz
-import glob
-import os
-import pandas as pd
-import random
+from typing import Tuple, Dict, Any, List
 
-def local_fft_normalization(image, patch_size=(16,16)):
+def calculate_local_fft_energy(image: np.ndarray, patch_size: Tuple[int, int] = (16, 16)) -> Tuple[float, float]:
+    """
+    Calculates the mean and standard deviation of FFT energy across image patches.
+    This serves as a metric for the overall texture and frequency content.
+
+    Args:
+        image (np.ndarray): Input grayscale image.
+        patch_size (Tuple[int, int]): The size of patches to analyze.
+
+    Returns:
+        A tuple containing the mean and standard deviation of patch energies.
+    """
     h, w = image.shape
-    patches = []
+    patch_energies = []
     for i in range(0, h, patch_size[0]):
         for j in range(0, w, patch_size[1]):
-            patch = image[i:i+patch_size[0], j:j+patch_size[1]]
-            patch_fft = np.fft.fft2(patch)
-            patch_energy = np.sum(np.abs(patch_fft))
-            patches.append(patch_energy)
-    return np.mean(patches), np.std(patches)
+            patch = image[i:i + patch_size[0], j:j + patch_size[1]]
+            if patch.size > 0:
+                # Energy is the sum of the magnitudes in the frequency domain
+                patch_fft = np.fft.fft2(patch)
+                patch_energy = np.sum(np.abs(patch_fft))
+                patch_energies.append(patch_energy)
+    
+    if not patch_energies:
+        return 0.0, 0.0
+        
+    return np.mean(patch_energies), np.std(patch_energies)
 
-
-def bimef(image, mu, a=-0.3293, b=1.1258, lambda_=0.5, sigma=5): 
+def apply_bimef(v_channel: np.ndarray, mu: float = 0.5, sigma: int = 5) -> np.ndarray:
     """
-    BIMEF 알고리즘 적용
-    #mu: weight map의 gamma coefficient, 조명 맵의 영향을 제어
-    #sigma: Gaussian smoothing에서의 표준 편차, 넓은 영역 평균 계산
+    Applies a simplified BIMEF algorithm to a single channel (V-channel).
+    This enhances the local contrast and brightness of the image.
+
+    Args:
+        v_channel (np.ndarray): The V-channel (brightness) of an HSV image.
+        mu (float): Gamma correction coefficient for the weight map.
+        sigma (int): Standard deviation for the Gaussian blur to create the illumination map.
+
+    Returns:
+        The enhanced V-channel.
     """
-    # 단일 채널인지 확인
-    if len(image.shape) == 2:  # 단일 채널 (grayscale or V channel)
-        is_single_channel = True
-        image = np.expand_dims(image, axis=-1)  # 채널 차원 추가
-    else:
-        is_single_channel = False
+    # Normalize to [0, 1] for processing
+    img_float = v_channel.astype(np.float32) / 255.0
 
-    # Scene illumination map 계산
-    t_b = np.max(image, axis=2) if not is_single_channel else image[:, :, 0]
-    t_b_smooth = cv2.GaussianBlur(t_b, (sigma * 2 + 1, sigma * 2 + 1), sigma)
+    # Illumination map is a blurred version of the V-channel
+    illumination_map = cv2.GaussianBlur(img_float, (2 * sigma + 1, 2 * sigma + 1), sigma)
+    
+    # Weight map controls the enhancement level
+    weight_map = np.clip(illumination_map ** mu, 0.0, 1.0)
+    
+    # Apply enhancement
+    enhanced_float = img_float * weight_map
+    
+    # Normalize back to [0, 255]
+    enhanced_uint8 = np.clip(enhanced_float * 255, 0, 255).astype(np.uint8)
+    
+    return enhanced_uint8
 
-    # Weight map 생성
-    weight_map = np.clip(t_b_smooth ** mu, 0, 1)
-
-    # 가중치 맵을 원본 이미지에 적용
-    enhanced_image = image * weight_map[..., np.newaxis]
-
-    # Normalize to [0, 255]
-    enhanced_image = (enhanced_image - enhanced_image.min()) / (enhanced_image.max() - enhanced_image.min()) * 255
-    enhanced_image = np.clip(enhanced_image, 0, 255).astype(np.uint8)
-
-    # 단일 채널 이미지라면 다시 차원 축소
-    if is_single_channel:
-        enhanced_image = enhanced_image[:, :, 0]
-
-    return enhanced_image
-
-
-def extract_triangle(image, fixed_size=(512,512), ratio_w=90/1255, ratio_h=100/1080):
+def crop_to_central_roi(image: np.ndarray, fixed_size: Tuple[int, int] = (512, 512)) -> np.ndarray:
     """
-    비율에 따라 삼각형 영역 제거 (크기 고정 후 작동)
-    - fixed_size: 이미지 크기를 고정된 크기로 조정
+    Resizes an image to a fixed size and crops to a central region to remove borders.
     """
-    # Resize image to fixed size
-    resized_image = cv2.resize(image, fixed_size)
+    resized = cv2.resize(image, fixed_size)
+    h, w = resized.shape[:2]
+    
+    # These ratios define the percentage of the border to crop
+    ratio_w, ratio_h = 90/1255, 100/1080
+    crop_w = int(ratio_w * w)
+    crop_h = int(ratio_h * h)
+    
+    return resized[crop_h:h - crop_h, crop_w:w - crop_w]
 
-    # Triangle 영역 제거
-    height, width = resized_image.shape[:2]
-    t_width = int(ratio_w * width)
-    t_height = int(ratio_h * height)
+def determine_fidelity_level(increase_ratio: float) -> int:
+    """ Maps the FFT energy increase ratio to a discrete Fidelity Level (0-5). """
+    if increase_ratio <= 0:   return 0
+    if increase_ratio <= 1:   return 1
+    if increase_ratio <= 5:   return 2
+    if increase_ratio <= 10:  return 3
+    if increase_ratio <= 15:  return 4
+    return 5
 
-    crop_width = width - 2 * t_width
-    crop_height = height - 2 * t_height
+def save_comparison_visualization(original: np.ndarray, enhanced: np.ndarray, save_path: str):
+    """ Saves a side-by-side comparison of the original and enhanced images. """
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.title("Original (Cropped)")
+    plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+    plt.axis("off")
+    plt.subplot(1, 2, 2)
+    plt.title("Enhanced (BIMEF on V-Channel)")
+    plt.imshow(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+    plt.axis("off")
+    plt.savefig(save_path)
+    plt.close()
 
-    center_y, center_x = height // 2, width // 2
-    start_y = max(center_y - crop_height // 2, 0)
-    end_y = min(center_y + crop_height // 2, height)
-    start_x = max(center_x - crop_width // 2, 0)
-    end_x = min(center_x + crop_width // 2, width)
-
-    cropped_image = resized_image[start_y:end_y, start_x:end_x]
-    return cropped_image
-
-def save_visualization_and_fft(cropped_image, enhanced_image, chosen_folder, base_name, label_str):
+def process_single_image(image_path: str, output_dir: str, mu: float, save_viz: bool) -> Dict[str, Any]:
     """
-    FFT 시각화 및 비교 이미지를 저장.
-    """
-    if random.random() <=1:  # 10% 확률로 실행
-        visualization_path = os.path.join(chosen_folder, f"{base_name}_visualization.png")
-        plt.figure(figsize=(12, 6))
-        plt.subplot(1, 2, 1)
-        plt.title("Original Cropped Image")
-        plt.imshow(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2RGB))
-        plt.axis("off")
-        plt.subplot(1, 2, 2)
-        plt.title("Enhanced Image (BIMEF on V)")
-        plt.imshow(cv2.cvtColor(enhanced_image, cv2.COLOR_BGR2RGB))
-        plt.axis("off")
-        plt.savefig(visualization_path)
-        plt.close()
-        print(f"[{label_str}] Visualization saved: {visualization_path}")
-    else:
-        print(f"[{label_str}] Visualization not saved (10% condition not met).")
-
-def process_image(image_path, output_folder, mu, freq_range=(0.01, 0.49), results=None): 
-    """
-    BIMEF 적용 후 PSD 넓이 비교 및 Local FFT Normalization 계산.
+    Processes a single image to calculate its surface integrity score.
     """
     image = cv2.imread(image_path)
     if image is None:
-        raise FileNotFoundError(f"Image not found: {image_path}")
+        raise FileNotFoundError(f"Image not found at {image_path}")
 
-    # (1) 삼각형 영역 제거
-    cropped_image = extract_triangle(image)
+    # 1. Pre-process the image
+    cropped_image = crop_to_central_roi(image)
+    
+    # 2. Apply BIMEF enhancement on the V-channel
+    hsv = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2]
+    enhanced_v = apply_bimef(v_channel, mu=mu)
+    hsv[:, :, 2] = enhanced_v
+    enhanced_image = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    # (2) V 채널 분리
-    hsv_image = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2HSV)
-    v_channel = hsv_image[:, :, 2]
+    # 3. Quantify texture before and after enhancement
+    original_gray = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
+    enhanced_gray = cv2.cvtColor(enhanced_image, cv2.COLOR_BGR2GRAY)
+    
+    orig_fft_mean, orig_fft_std = calculate_local_fft_energy(original_gray)
+    enh_fft_mean, enh_fft_std = calculate_local_fft_energy(enhanced_gray)
 
-    # (3) BIMEF 적용 (V 채널)
-    enhanced_v = bimef(v_channel, mu=mu)
-
-    # (4) V 채널 복원 후 HSV -> BGR 변환
-    hsv_image[:, :, 2] = enhanced_v
-    enhanced_image = cv2.cvtColor(hsv_image, cv2.COLOR_HSV2BGR)
-
-    # (6) Local FFT Normalization 계산
-    cropped_fft_mean, cropped_fft_std = local_fft_normalization(cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY))
-    enhanced_fft_mean, enhanced_fft_std = local_fft_normalization(cv2.cvtColor(enhanced_image, cv2.COLOR_BGR2GRAY))
-
-    # 새로운 방식
-    fft_increase_ratio = (enhanced_fft_mean - cropped_fft_mean) / cropped_fft_mean * 100
-    #print(f"[INFO] Local FFT Mean Ratio => Increase Ratio: {increase_ratio:.4f}")
-
-    # (8) Fidelity 단계 기준 설정
-    base_name = os.path.basename(image_path).split(".")[0]
-    fidelity_level = determine_fidelity_level(fft_increase_ratio)
-
-    # Fidelity에 따라 폴더 생성
-    chosen_folder = os.path.join(output_folder, f"Fidelity_{fidelity_level}")
-    os.makedirs(chosen_folder, exist_ok=True)
-
-    # 결과 이미지 저장
-    enhanced_image_path = os.path.join(chosen_folder, f"{base_name}.png")
-    cv2.imwrite(enhanced_image_path, enhanced_image)
-
-    if results is not None:
-        results.append({
-            "image_name": base_name,
-            "fidelity_level": fidelity_level,
-            "fft_increase_ratio": fft_increase_ratio,
-            "cropped_fft_mean": cropped_fft_mean,
-            "cropped_fft_std": cropped_fft_std,
-            "enhanced_fft_mean": enhanced_fft_mean,
-            "enhanced_fft_std": enhanced_fft_std,
-        })
-
-    save_visualization_and_fft(cropped_image, enhanced_image, chosen_folder, base_name, f"Fidelity {fidelity_level}")
-
-def determine_fidelity_level(increase_ratio):
-    if increase_ratio <= 0:
-        return 0
-    elif increase_ratio <= 1:
-        return 1
-    elif increase_ratio <= 5:
-        return 2
-    elif increase_ratio <= 10:
-        return 3
-    elif increase_ratio <= 15:
-        return 4
+    # 4. Calculate the final score: the percentage increase in texture
+    if orig_fft_mean == 0:
+        increase_ratio = np.inf if enh_fft_mean > 0 else 0
     else:
-        return 5
+        increase_ratio = (enh_fft_mean - orig_fft_mean) / orig_fft_mean * 100
 
+    # 5. Classify and prepare results
+    fidelity_level = determine_fidelity_level(increase_ratio)
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    
+    level_dir = os.path.join(output_dir, f"Fidelity_{fidelity_level}")
+    os.makedirs(level_dir, exist_ok=True)
+    
+    # Save the enhanced image
+    cv2.imwrite(os.path.join(level_dir, f"{base_name}_enhanced.png"), enhanced_image)
+    
+    # Optionally save comparison visualization
+    if save_viz:
+        viz_path = os.path.join(level_dir, f"{base_name}_comparison.png")
+        save_comparison_visualization(cropped_image, enhanced_image, viz_path)
 
-def process_multiple_images(input_folder, output_folder, csv_path, mu, freq_range=(0.01, 0.49)):
-    os.makedirs(output_folder, exist_ok=True)
-    results = []
-    image_paths = glob.glob(os.path.join(input_folder, "*.png"))
+    return {
+        "image_name": base_name,
+        "fidelity_level": fidelity_level,
+        "fft_increase_ratio": increase_ratio,
+        "original_fft_mean": orig_fft_mean,
+        "enhanced_fft_mean": enh_fft_mean,
+    }
 
+def main(args):
+    image_paths = sorted(glob.glob(os.path.join(args.input_dir, "*.png")))
     if not image_paths:
-        print(f"No PNG images found in {input_folder}")
+        print(f"[ERROR] No PNG images found in '{args.input_dir}'.")
         return
 
-    for image_path in image_paths:
-        try:
-            process_image(image_path, output_folder, mu, freq_range, results)
-        except Exception as e:
-            print(f"Error processing {image_path}: {e}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    results: List[Dict[str, Any]] = []
 
-    results_df = pd.DataFrame(results)
-    results_df.to_csv(csv_path, index=False)
-    print(f"Results saved to {csv_path}")
+    print(f"--- Surface Integrity Analysis via Enhancement Potential ---")
+    print(f"Found {len(image_paths)} images to process.")
+    print(f"BIMEF mu parameter: {args.mu}")
+
+    for path in image_paths:
+        try:
+            result = process_single_image(path, args.output_dir, args.mu, args.save_visualizations)
+            results.append(result)
+            print(f"Processed '{os.path.basename(path)}' -> Fidelity Level: {result['fidelity_level']}")
+        except Exception as e:
+            print(f"Failed to process '{os.path.basename(path)}': {e}")
+    
+    # Save summary CSV
+    csv_path = os.path.join(args.output_dir, "surface_integrity_results.csv")
+    pd.DataFrame(results).to_csv(csv_path, index=False)
+    print(f"\n--- Analysis Complete ---")
+    print(f"Results saved in '{args.output_dir}'")
+    print(f"Summary CSV saved to '{csv_path}'")
 
 if __name__ == "__main__":
-    input_folder = "../1-0.Train_DB/"
-    output_folder = "./250121_output_images_BIMEF"
-    csv_path = "./250121_Surface_Integrity_results.csv"
-    freq_range = (0.01, 0.49)
-    process_multiple_images(input_folder, output_folder, csv_path, mu=0.5, freq_range=freq_range)
-
-    #BIMEF 에서 주로 사용한 sigma 5, mu 0.5를 그대로 사용.
+    parser = argparse.ArgumentParser(description="Quantify image surface integrity based on its enhancement potential.")
+    parser.add_argument("-i", "--input_dir", required=True, help="Directory containing input PNG images.")
+    parser.add_argument("-o", "--output_dir", default="./surface_integrity_output", help="Directory to save results.")
+    parser.add_argument("--mu", type=float, default=0.5, help="Mu parameter for the BIMEF enhancement algorithm.")
+    parser.add_argument("--save_visualizations", action="store_true", help="Save side-by-side comparison images.")
+    
+    args = parser.parse_args()
+    main(args)
