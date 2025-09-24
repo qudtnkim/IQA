@@ -2,114 +2,154 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.mixture import GaussianMixture
-from scipy.stats import norm
 
-def analyze_s_frequency_gmm(csv_path, output_csv_path, n_components=2):
+def analyze_clarity_with_gmm(
+    input_csv_path: str,
+    output_csv_path: str,
+    column_name: str = "S Frequency Ratio",
+    n_components: int = 2
+) -> float:
     """
-    Analyze S Frequency Ratios using GMM and calculate Strong Threshold.
-    
+    Analyzes image clarity scores using a Gaussian Mixture Model (GMM) to
+    identify a threshold for separating clear vs. unclear images.
+
+    This function assumes the distribution of clarity scores is bimodal,
+    representing two primary groups (e.g., 'blurry' and 'clear' images).
+    It fits a GMM with two components and calculates a threshold based on the
+    statistical properties of the component with the lower mean score.
+
     Args:
-        csv_path: Input CSV file containing at least ["Image Name", "S Frequency Ratio"].
-        output_csv_path: Where to save the result CSV with an added "Cluster" column.
-        n_components: Number of Gaussian components (default: 2 for bimodal).
+        input_csv_path (str): Path to the input CSV file. The file must contain
+                              a column with clarity scores.
+        output_csv_path (str): Path to save the output CSV. The saved file will
+                               include a new 'Cluster' column.
+        column_name (str): The name of the column containing the clarity scores
+                           (e.g., "S Frequency Ratio").
+        n_components (int): The number of Gaussian components to fit. Defaults to 2.
 
     Returns:
-        Strong Threshold (float): The upper bound of the 3σ range for the smaller-mean component.
+        float: The calculated clarity threshold, defined as the upper bound of the
+               3-sigma range of the Gaussian component with the smaller mean.
     """
 
-    # 1) Load CSV
-    df = pd.read_csv(csv_path)
+    # --- 1. Load and Prepare Data ---
+    print(f"Loading data from '{input_csv_path}'...")
+    try:
+        df = pd.read_csv(input_csv_path)
+        if column_name not in df.columns:
+            raise ValueError(f"Column '{column_name}' not found in the CSV file.")
+    except FileNotFoundError:
+        print(f"Error: The file '{input_csv_path}' was not found.")
+        return -1.0
+    
+    # Extract the target column and reshape for sklearn
+    X = df[column_name].values.reshape(-1, 1)
 
-    # 2) Extract data for GMM (reshape to (n,1))
-    X = df["S Frequency Ratio"].values.reshape(-1, 1)
-
-    # 3) Fit GMM
-    gmm = GaussianMixture(n_components=n_components, random_state=42)
+    # --- 2. Fit Gaussian Mixture Model ---
+    print("Fitting Gaussian Mixture Model...")
+    gmm = GaussianMixture(n_components=n_components, random_state=42, n_init=10)
     gmm.fit(X)
 
-    # Means, variances, and weights
-    means = gmm.means_.flatten()
-    covars = gmm.covariances_.flatten()  # for 1D, covariance is just a 1D array
-    weights = gmm.weights_.flatten()
-
-    # 4) Assign each sample to a cluster
-    cluster_labels = gmm.predict(X)  # array of 0 or 1, etc.
+    # Assign cluster labels to the original data
+    cluster_labels = gmm.predict(X)
     df["Cluster"] = cluster_labels
 
-    # 5) Print summary
-    print("=== GMM Results ===")
+    # --- 3. Extract GMM Parameters and Print Summary ---
+    means = gmm.means_.flatten()
+    std_devs = np.sqrt(gmm.covariances_.flatten())
+    weights = gmm.weights_.flatten()
+
+    print("\n" + "="*25)
+    print(" GMM Fit Results")
+    print("="*25)
     for i in range(n_components):
-        print(f"Component {i}: mean={means[i]:.4f}, var={covars[i]:.4f}, weight={weights[i]:.4f}")
+        print(f"  Component {i}:")
+        print(f"    - Mean      = {means[i]:.4f}")
+        print(f"    - Std. Dev. = {std_devs[i]:.4f}")
+        print(f"    - Weight    = {weights[i]:.4f}")
 
-    # (추가 기능) 평균이 더 작은 성분의 3σ, 6σ 범위 계산
-    idx_small = np.argmin(means)             # 평균이 더 작은 index
-    mu_small = means[idx_small]
-    var_small = covars[idx_small]
-    sigma_small = np.sqrt(var_small)
- 
-    range_3sigma = (mu_small - 3*sigma_small, mu_small + 3*sigma_small)
+    # --- 4. Calculate Clarity Threshold ---
+    # Identify the component with the smaller mean. This component is assumed to
+    # represent the cluster of 'blurry' or 'low-clarity' images.
+    blurry_cluster_index = np.argmin(means)
+    mu_blurry = means[blurry_cluster_index]
+    sigma_blurry = std_devs[blurry_cluster_index]
 
-    print("\n[INFO] Smaller-mean component index:", idx_small)
-    print(f"[INFO] => mu={mu_small:.4f}, sigma={sigma_small:.4f}")
-    print(f"[INFO] => 3σ range = {range_3sigma[0]:.4f} ~ {range_3sigma[1]:.4f}")
+    # The threshold is defined as the upper bound of the 3-sigma range for this component.
+    # According to the 3-sigma rule, this covers ~99.7% of the data in this cluster.
+    clarity_threshold = mu_blurry + 3 * sigma_blurry
 
-    # Strong Threshold: 3σ 범위의 상한값
-    strong_threshold = range_3sigma[1]
-    print(f"[INFO] Strong Threshold (3σ upper bound): {strong_threshold:.4f}")
-
-    # 6) Save the updated DataFrame to a new CSV
-    df.to_csv(output_csv_path, index=False)
-    print(f"[INFO] Updated CSV with 'Cluster' column saved to {output_csv_path}")
-
-    # 7) (Optional) Plot histogram & GMM PDF
-    plt.figure(figsize=(8, 5))
-    plt.hist(X, bins=30, density=True, alpha=0.5, color="gray", edgecolor="black", label="Histogram")
-
-    # Plot the mixture PDF across a range of x-values
-    x_min, x_max = X.min(), X.max()
-    x_plot = np.linspace(x_min, x_max, 300).reshape(-1, 1)
-    logprob = gmm.score_samples(x_plot)
-    pdf = np.exp(logprob)
-    plt.plot(x_plot, pdf, 'r-', label="GMM Mixture PDF")
-
-    # Plot each component individually
-    responsibilities = gmm.predict_proba(x_plot)  # shape: (300, n_components)
-    pdf_individual = responsibilities * pdf[:, np.newaxis]
-
-    for i in range(n_components):
-        plt.plot(
-            x_plot,
-            pdf_individual[:, i],
-            linestyle="--",
-            linewidth=1.5,
-            label=f"GMM Component {i}"
-        )
+    print("\n" + "="*30)
+    print(" Clarity Threshold Calculation")
+    print("="*30)
+    print(f"  Identifying component with the smaller mean (assumed 'blurry')...")
+    print(f"  Blurry Component Index: {blurry_cluster_index}")
+    print(f"  Mean (μ): {mu_blurry:.4f}, Std. Dev. (σ): {sigma_blurry:.4f}")
+    print(f"  3-Sigma Range: ({mu_blurry - 3 * sigma_blurry:.4f}, {mu_blurry + 3 * sigma_blurry:.4f})")
+    print(f"  => Calculated Threshold (μ + 3σ): {clarity_threshold:.4f}")
     
-    # 수직선으로 3σ, 6σ 범위를 표시 (작은 평균 성분 기준)
-    ymin, ymax = plt.ylim()
-    plt.vlines([range_3sigma[0], range_3sigma[1]], ymin, ymax * 0.3, 
-               colors="blue", linestyles=":", label="3σ range")
+    # --- 5. Save Results ---
+    df.to_csv(output_csv_path, index=False)
+    print(f"\n[SUCCESS] Data with cluster assignments saved to '{output_csv_path}'.")
 
-    plt.xlabel("High-Frequency to Low-Frequency Ratio")
-    plt.ylabel("Density")
-    plt.title("HLFR Histogram + GMM Fit (with 3σ Range)")
+    # --- 6. Visualize the Results (Publication Quality Plot) ---
+    plt.style.use('seaborn-v0_8-paper')
+    plt.figure(figsize=(10, 6))
+
+    # Plot histogram of the data
+    plt.hist(X, bins=50, density=True, alpha=0.6, color="lightgray", label="Data Histogram")
+
+    # Plot the individual Gaussian components
+    x_plot = np.linspace(X.min(), X.max(), 1000).reshape(-1, 1)
+    for i in range(n_components):
+        # Calculate the PDF for each component, scaled by its weight
+        pdf = weights[i] * norm(means[i], std_devs[i]).pdf(x_plot)
+        linestyle = '--' if i == blurry_cluster_index else '-.'
+        plt.plot(x_plot, pdf, linestyle=linestyle, label=f"GMM Component {i}")
+
+    # Plot the total GMM probability density function
+    logprob = gmm.score_samples(x_plot)
+    plt.plot(x_plot, np.exp(logprob), 'r-', linewidth=2, label="Total GMM PDF")
+    
+    # Highlight the calculated threshold with a vertical line
+    plt.axvline(
+        clarity_threshold,
+        color='black',
+        linestyle=':',
+        linewidth=2,
+        label=f"Clarity Threshold = {clarity_threshold:.2f}"
+    )
+
+    plt.title(f"Distribution of '{column_name}' and GMM Fit", fontsize=16)
+    plt.xlabel(column_name, fontsize=12)
+    plt.ylabel("Density", fontsize=12)
     plt.legend()
-    plt.grid(True)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.show()
 
-    return strong_threshold
+    return clarity_threshold
 
 
+# --- Main execution block ---
 if __name__ == "__main__":
-    # Example usage:
-    input_csv = "250120_S_CHANNEL_Clarity_result.csv"     # CSV with ["Image Name", "S Frequency Ratio"]
-    output_csv = "whole_train_gmm.csv"
+    # --- Configuration ---
+    # Define the path to your input CSV file
+    INPUT_CSV = "250120_S_CHANNEL_Clarity_result.csv"
+    
+    # Define the path for the output CSV file
+    OUTPUT_CSV = "whole_train_clarity_gmm_results.csv"
+    
+    # Specify the name of the column containing the clarity metric
+    CLARITY_COLUMN = "S Frequency Ratio"
 
-    strong_threshold = analyze_s_frequency_gmm(
-        csv_path=input_csv,
-        output_csv_path=output_csv,
+    # --- Run Analysis ---
+    final_threshold = analyze_clarity_with_gmm(
+        input_csv_path=INPUT_CSV,
+        output_csv_path=OUTPUT_CSV,
+        column_name=CLARITY_COLUMN,
         n_components=2
     )
-
-    print(f"\nFinal Strong Threshold: {strong_threshold:.4f}")
+    
+    if final_threshold != -1.0:
+        print(f"\nAnalysis complete. The final calculated threshold is: {final_threshold:.4f}")
